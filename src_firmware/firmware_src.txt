@@ -1,0 +1,1338 @@
+#!/usr/bin/env python3
+import os
+import time
+import math
+import socket
+import threading
+from datetime import datetime
+from collections import deque
+
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+import serial
+import pynmea2
+
+from smartcard.System import readers
+from smartcard.Exceptions import NoCardException, CardConnectionException
+
+from PIL import Image
+from luma.core.interface.serial import spi
+from luma.lcd.device import ili9488
+
+import pigpio
+
+
+# ---------------- NFC ----------------
+GET_UID_APDU = [0xFF, 0xCA, 0x00, 0x00, 0x00]
+
+KNOWN_CARDS = {
+    "04151F02A51390": {"name": "Card 01", "active": True},
+    "04196702A51390": {"name": "Card 02", "active": True},
+    "041E6502A51390": {"name": "Card 03", "active": True},
+    "04295B02A51390": {"name": "Card 04", "active": True},
+    "042B5D02A51390": {"name": "Card 05", "active": True},
+    "042B6C02A51390": {"name": "Card 06", "active": True},
+    "04356402A51390": {"name": "Card 07", "active": False},
+    "043F7502A51390": {"name": "Card 08", "active": False},
+    "04417302A51390": {"name": "Card 09", "active": False},
+    "04431802A51390": {"name": "Card 10", "active": False},
+}
+
+# ---------------- User / validation config ----------------
+USERS_COLLECTION = os.getenv("USERS_COLLECTION", "users").strip()
+USER_CARD_FIELD = os.getenv("USER_CARD_FIELD", "cardNumber").strip()
+USER_STATUS_FIELD = os.getenv("USER_STATUS_FIELD", "status").strip()
+REQUIRED_STATUS = os.getenv("REQUIRED_STATUS", "waiting").strip().lower()
+REQUIRE_WAITING_STATUS = os.getenv("REQUIRE_WAITING_STATUS", "1").strip().lower() in ("1", "true", "yes")
+
+USER_BALANCE_FIELD = os.getenv("USER_BALANCE_FIELD", "balance").strip()
+USER_ROUTE_FIELD = os.getenv("USER_ROUTE_FIELD", "currentRoute").strip()
+USER_ROUTE_FROM_FIELD = os.getenv("USER_ROUTE_FROM_FIELD", "from").strip()
+USER_ROUTE_TO_FIELD = os.getenv("USER_ROUTE_TO_FIELD", "to").strip()
+
+# ---------------- System availability monitor ----------------
+SYSTEM_CHECK_SEC = float(os.getenv("SYSTEM_CHECK_SEC", "3.0"))
+SYSTEM_SOCKET_TIMEOUT_SEC = float(os.getenv("SYSTEM_SOCKET_TIMEOUT_SEC", "2.0"))
+SYSTEM_PROBE_HOST = os.getenv("SYSTEM_PROBE_HOST", "firestore.googleapis.com").strip()
+SYSTEM_PROBE_PORT = int(os.getenv("SYSTEM_PROBE_PORT", "443"))
+
+FARE_MATRIX = {
+    (1, 1): 0.0,  (1, 2): 15.0, (1, 3): 30.0, (1, 4): 45.0,
+    (2, 1): 15.0, (2, 2): 0.0,  (2, 3): 15.0, (2, 4): 30.0,
+    (3, 1): 30.0, (3, 2): 15.0, (3, 3): 0.0,  (3, 4): 15.0,
+    (4, 1): 45.0, (4, 2): 30.0, (4, 3): 15.0, (4, 4): 0.0,
+}
+
+# ---------------- Paths and assets ----------------
+BASE = os.path.expanduser("~/afcs/device")
+ASSETS = os.path.join(BASE, "assets")
+DEFAULT_PNG = os.path.join(ASSETS, "default.png")
+INVALID_PNG = os.path.join(ASSETS, "invalid.png")
+VALID_PNG = os.path.join(ASSETS, "valid.png")
+DESTINATION_NOT_SELECTED_PNG = os.path.join(ASSETS, "destination_not_selected.png")
+INACTIVE_ACCOUNT_PNG = os.path.join(ASSETS, "inactive_account.png")
+UNREGISTERED_ACCOUNT_PNG = os.path.join(ASSETS, "unregistered_account.png")
+DUPLICATE_TAP_PNG = os.path.join(ASSETS, "duplicate_tap_detected.png")
+NO_SEATS_AVAILABLE_PNG = os.path.join(ASSETS, "no_seats_available.png")
+PASSENGER_STILL_BOARDING_PNG = os.path.join(ASSETS, "passenger_still_boarding.png")
+INSUFFICIENT_BALANCE_PNG = os.path.join(ASSETS, "insufficient_balance.png")
+SYSTEM_UNAVAILABLE_PNG = os.path.join(ASSETS, "system_unavailable.png")
+
+# ---------------- TFT ----------------
+TFT_WIDTH = 480
+TFT_HEIGHT = 320
+TFT_DC_GPIO = 24
+TFT_RST_GPIO = 25
+TFT_SPI_PORT = 0
+TFT_SPI_DEVICE = 0
+TFT_SPI_SPEED = 4_000_000
+TFT_ROTATE = 0
+
+SHOW_VALID_SEC = float(os.getenv("SHOW_VALID_SEC", "1.3"))
+SHOW_INVALID_SEC = float(os.getenv("SHOW_INVALID_SEC", "2.0"))
+
+# ---------------- Servo pulse mapping ----------------
+SERVO_MIN_US = int(os.getenv("SERVO_MIN_US", "500"))
+SERVO_MAX_US = int(os.getenv("SERVO_MAX_US", "2500"))
+SERVO_SETTLE_SEC = float(os.getenv("SERVO_SETTLE_SEC", "0.40"))
+SERVO_HOLD_OPEN = os.getenv("SERVO_HOLD_OPEN", "1").strip().lower() in ("1", "true", "yes")
+
+# ---------------- Servo defaults ----------------
+SERVO1_GPIO = int(os.getenv("SERVO1_GPIO", "18"))
+SERVO1_OPEN_ANGLE = float(os.getenv("SERVO1_OPEN_ANGLE", "90"))
+SERVO1_CLOSE_ANGLE = float(os.getenv("SERVO1_CLOSE_ANGLE", "0"))
+
+SERVO2_GPIO = int(os.getenv("SERVO2_GPIO", "13"))
+SERVO2_OPEN_ANGLE = float(os.getenv("SERVO2_OPEN_ANGLE", "90"))
+SERVO2_CLOSE_ANGLE = float(os.getenv("SERVO2_CLOSE_ANGLE", "180"))
+
+# ---------------- IR ----------------
+IR_ACTIVE_LOW = os.getenv("IR_ACTIVE_LOW", "1").strip().lower() in ("1", "true", "yes")
+IR_DEBOUNCE_SEC = float(os.getenv("IR_DEBOUNCE_SEC", "0.15"))
+
+IR1_GPIO = int(os.getenv("IR1_GPIO", "23"))
+IR2_GPIO = int(os.getenv("IR2_GPIO", "27"))
+
+IR_CLEAR_CLOSE_DELAY_SEC = float(os.getenv("IR_CLEAR_CLOSE_DELAY_SEC", "10.0"))
+PENDING_SIT_TIMEOUT_SEC = float(os.getenv("PENDING_SIT_TIMEOUT_SEC", "20.0"))
+
+# ---------------- GPS ----------------
+GPS_PORT = os.getenv("GPS_PORT", "/dev/serial0")
+GPS_BAUD = int(os.getenv("GPS_BAUD", "9600"))
+
+GPS_UPLOAD_SEC = float(os.getenv("GPS_UPLOAD_SEC", "2.0"))
+GPS_FORCE_SEC = float(os.getenv("GPS_FORCE_SEC", "0.0"))
+GPS_MIN_MOVE_M = float(os.getenv("GPS_MIN_MOVE_M", "3.0"))
+
+TERMINALS_REFRESH_SEC = float(os.getenv("TERMINALS_REFRESH_SEC", "10.0"))
+DEFAULT_RADIUS_M = float(os.getenv("DEFAULT_RADIUS_M", "40.0"))
+
+GPS_MIN_FIX_QUALITY = int(os.getenv("GPS_MIN_FIX_QUALITY", "1"))
+GPS_MAX_HDOP = float(os.getenv("GPS_MAX_HDOP", "3.5"))
+GPS_MIN_SATS = int(os.getenv("GPS_MIN_SATS", "7"))
+
+GPS_USE_GGA_ONLY = os.getenv("GPS_USE_GGA_ONLY", "1").strip().lower() in ("1", "true", "yes")
+GPS_SMOOTH_N = int(os.getenv("GPS_SMOOTH_N", "7"))
+GPS_STABLE_SEC = float(os.getenv("GPS_STABLE_SEC", "2.5"))
+
+GPS_EXIT_MARGIN_M = float(os.getenv("GPS_EXIT_MARGIN_M", "10.0"))
+GPS_SWITCH_BIAS_M = float(os.getenv("GPS_SWITCH_BIAS_M", "5.0"))
+
+# ---------------- Firestore ----------------
+DEVICE_ID = os.getenv("DEVICE_ID", "cpe11-afcs")
+FS_ROOT = os.getenv("FS_ROOT", "rp4_debug")
+CITY_ID = os.getenv("CITY_ID", "laguna_calamba_cabuyao_routeA")
+
+
+def _now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def ensure_assets():
+    for p in (
+        DEFAULT_PNG,
+        INVALID_PNG,
+        VALID_PNG,
+        DESTINATION_NOT_SELECTED_PNG,
+        INACTIVE_ACCOUNT_PNG,
+        UNREGISTERED_ACCOUNT_PNG,
+        DUPLICATE_TAP_PNG,
+        NO_SEATS_AVAILABLE_PNG,
+        PASSENGER_STILL_BOARDING_PNG,
+        INSUFFICIENT_BALANCE_PNG,
+        SYSTEM_UNAVAILABLE_PNG,
+    ):
+        if not os.path.exists(p):
+            raise RuntimeError(f"Missing TFT asset: {p}")
+
+
+def init_firestore():
+    sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if not sa_path or not os.path.exists(sa_path):
+        raise RuntimeError(
+            "Missing GOOGLE_APPLICATION_CREDENTIALS or file not found.\n"
+            "Example:\n"
+            "  export GOOGLE_APPLICATION_CREDENTIALS=/home/cpe11/afcs/backend/secrets/firebase-admin.json"
+        )
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(sa_path)
+        firebase_admin.initialize_app(cred)
+    return firestore.client()
+
+
+def fs_refs(db):
+    root = db.collection(FS_ROOT).document(DEVICE_ID)
+    taps = root.collection("taps")
+    seat_events = root.collection("seatEvents")
+    gps_current = root.collection("gps").document("current")
+    terminals_col = root.collection("gps_calibration").document(CITY_ID).collection("terminals")
+    users_col = db.collection(USERS_COLLECTION)
+    return root, taps, seat_events, gps_current, terminals_col, users_col
+
+
+def pick_reader():
+    r = readers()
+    if not r:
+        raise RuntimeError("No PCSC readers found. Check ACR1252U + pcscd.")
+    for rr in r:
+        if "PICC" in str(rr):
+            return rr
+    return r[0]
+
+
+def read_uid_once(reader_obj):
+    conn = reader_obj.createConnection()
+    try:
+        conn.connect()
+        data, sw1, sw2 = conn.transmit(GET_UID_APDU)
+        if (sw1, sw2) != (0x90, 0x00):
+            return None
+        return "".join(f"{b:02X}" for b in data).upper()
+    except (NoCardException, CardConnectionException):
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.disconnect()
+        except Exception:
+            pass
+
+
+def validate_uid(uid: str):
+    uid = (uid or "").upper().strip()
+    info = KNOWN_CARDS.get(uid)
+    if info is None:
+        return {"known": False, "active": False, "name": None, "reason": "Unknown card"}
+    if not bool(info.get("active", False)):
+        return {"known": True, "active": False, "name": info.get("name"), "reason": "Inactive card"}
+    return {"known": True, "active": True, "name": info.get("name"), "reason": "Valid card"}
+
+
+def normalize_terminal_index(value):
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 1 <= value <= 4 else None
+    if isinstance(value, float):
+        iv = int(value)
+        return iv if 1 <= iv <= 4 else None
+
+    s = str(value).strip().lower()
+    if not s or s in ("unknown", "null", "none"):
+        return None
+    if s.startswith("terminal"):
+        s = s.replace("terminal", "", 1).strip()
+
+    try:
+        iv = int(s)
+        return iv if 1 <= iv <= 4 else None
+    except Exception:
+        return None
+
+
+def compute_required_fare_php(origin_terminal_idx, dest_terminal_idx):
+    if origin_terminal_idx is None or dest_terminal_idx is None:
+        return None
+    return FARE_MATRIX.get((int(origin_terminal_idx), int(dest_terminal_idx)))
+
+
+def lookup_user_by_card(users_col, uid: str):
+    """
+    Returns:
+      ("ok", user_id, user_data, "OK")
+      ("no_linked_user", None, None, "No user linked to card")
+      ("unavailable", None, None, "...exception...")
+    """
+    try:
+        snaps = users_col.where(USER_CARD_FIELD, "==", uid).limit(1).get()
+    except Exception as e:
+        return "unavailable", None, None, f"User lookup failed: {e}"
+
+    if not snaps:
+        return "no_linked_user", None, None, "No user linked to card"
+
+    snap = snaps[0]
+    data = snap.to_dict() or {}
+    return "ok", snap.id, data, "OK"
+
+
+def user_has_required_status(user_data):
+    if not REQUIRE_WAITING_STATUS:
+        return True, "Destination gate disabled"
+
+    status = str(user_data.get(USER_STATUS_FIELD, "")).strip().lower()
+    if status != REQUIRED_STATUS:
+        return False, "Destination not selected"
+
+    return True, "OK"
+
+
+def find_duplicate_tap(uid: str, seats):
+    """
+    Duplicate tap means the same UID already owns a seat locally,
+    either while boarding (PENDING) or already seated (OCCUPIED).
+    """
+    for seat in seats:
+        if seat.seat_uid != uid:
+            continue
+
+        if seat.state == seat.PENDING:
+            return True, seat.seat_id, "boarding"
+
+        if seat.state == seat.OCCUPIED:
+            return True, seat.seat_id, "in_seat"
+
+    return False, None, None
+
+
+def check_user_balance_for_trip_by_data(user_data):
+    """
+    Returns:
+      (decision, reason, current_balance, required_fare, route_from, route_to)
+
+    decision values:
+      "allow"        -> continue normal flow
+      "reject"       -> insufficient balance
+      "invalid_data" -> do not reject, continue conservatively
+    """
+    raw_balance = user_data.get(USER_BALANCE_FIELD)
+    try:
+        current_balance = float(raw_balance)
+    except Exception:
+        return "invalid_data", f"User balance invalid: {raw_balance}", None, None, None, None
+
+    current_route = user_data.get(USER_ROUTE_FIELD) or {}
+    if not isinstance(current_route, dict):
+        return "invalid_data", f"User route invalid: {current_route}", current_balance, None, None, None
+
+    route_from = normalize_terminal_index(current_route.get(USER_ROUTE_FROM_FIELD))
+    route_to = normalize_terminal_index(current_route.get(USER_ROUTE_TO_FIELD))
+
+    if route_from is None or route_to is None:
+        return (
+            "invalid_data",
+            f"Route terminals invalid. from={current_route.get(USER_ROUTE_FROM_FIELD)} to={current_route.get(USER_ROUTE_TO_FIELD)}",
+            current_balance,
+            None,
+            route_from,
+            route_to,
+        )
+
+    required_fare = compute_required_fare_php(route_from, route_to)
+    if required_fare is None:
+        return "invalid_data", f"Fare matrix missing entry for {route_from}->{route_to}", current_balance, None, route_from, route_to
+
+    if current_balance < required_fare:
+        return "reject", "Insufficient balance", current_balance, required_fare, route_from, route_to
+
+    return "allow", "OK", current_balance, required_fare, route_from, route_to
+
+
+def angle_to_us(angle):
+    a = max(0.0, min(180.0, float(angle)))
+    return int(SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * (a / 180.0))
+
+
+class TFTUI:
+    def __init__(self):
+        ensure_assets()
+        try:
+            import RPi.GPIO as GPIO
+            GPIO.setwarnings(False)
+        except Exception:
+            pass
+
+        self.serial = spi(
+            port=TFT_SPI_PORT,
+            device=TFT_SPI_DEVICE,
+            gpio_DC=TFT_DC_GPIO,
+            gpio_RST=TFT_RST_GPIO,
+            bus_speed_hz=TFT_SPI_SPEED,
+        )
+        self.device = ili9488(self.serial, width=TFT_WIDTH, height=TFT_HEIGHT, rotate=TFT_ROTATE)
+
+        self.default_img = Image.open(DEFAULT_PNG).convert("RGB").resize((TFT_WIDTH, TFT_HEIGHT))
+        self.invalid_img = Image.open(INVALID_PNG).convert("RGB").resize((TFT_WIDTH, TFT_HEIGHT))
+        self.valid_img = Image.open(VALID_PNG).convert("RGB").resize((TFT_WIDTH, TFT_HEIGHT))
+        self.destination_not_selected_img = Image.open(DESTINATION_NOT_SELECTED_PNG).convert("RGB").resize((TFT_WIDTH, TFT_HEIGHT))
+        self.inactive_account_img = Image.open(INACTIVE_ACCOUNT_PNG).convert("RGB").resize((TFT_WIDTH, TFT_HEIGHT))
+        self.unregistered_account_img = Image.open(UNREGISTERED_ACCOUNT_PNG).convert("RGB").resize((TFT_WIDTH, TFT_HEIGHT))
+        self.duplicate_tap_img = Image.open(DUPLICATE_TAP_PNG).convert("RGB").resize((TFT_WIDTH, TFT_HEIGHT))
+        self.no_seats_available_img = Image.open(NO_SEATS_AVAILABLE_PNG).convert("RGB").resize((TFT_WIDTH, TFT_HEIGHT))
+        self.passenger_still_boarding_img = Image.open(PASSENGER_STILL_BOARDING_PNG).convert("RGB").resize((TFT_WIDTH, TFT_HEIGHT))
+        self.insufficient_balance_img = Image.open(INSUFFICIENT_BALANCE_PNG).convert("RGB").resize((TFT_WIDTH, TFT_HEIGHT))
+        self.system_unavailable_img = Image.open(SYSTEM_UNAVAILABLE_PNG).convert("RGB").resize((TFT_WIDTH, TFT_HEIGHT))
+
+        self.show_default()
+
+    def show(self, img):
+        self.device.display(img)
+
+    def show_default(self):
+        self.show(self.default_img)
+
+    def show_invalid(self):
+        self.show(self.invalid_img)
+
+    def show_valid(self):
+        self.show(self.valid_img)
+
+    def show_destination_not_selected(self):
+        self.show(self.destination_not_selected_img)
+
+    def show_inactive_account(self):
+        self.show(self.inactive_account_img)
+
+    def show_unregistered_account(self):
+        self.show(self.unregistered_account_img)
+
+    def show_duplicate_tap(self):
+        self.show(self.duplicate_tap_img)
+
+    def show_no_seats_available(self):
+        self.show(self.no_seats_available_img)
+
+    def show_passenger_still_boarding(self):
+        self.show(self.passenger_still_boarding_img)
+
+    def show_insufficient_balance(self):
+        self.show(self.insufficient_balance_img)
+
+    def show_system_unavailable(self):
+        self.show(self.system_unavailable_img)
+
+
+def show_invalid_reason(ui: TFTUI, reason: str):
+    reason = str(reason or "").strip()
+
+    if reason == "System unavailable":
+        ui.show_system_unavailable()
+    elif reason in ("Inactive card", "Inactive account"):
+        ui.show_inactive_account()
+    elif reason in ("Unknown card", "Unregistered account", "No user linked to card"):
+        ui.show_unregistered_account()
+    elif reason == "Duplicate tap detected":
+        ui.show_duplicate_tap()
+    elif reason == "Destination not selected":
+        ui.show_destination_not_selected()
+    elif reason == "Insufficient balance":
+        ui.show_insufficient_balance()
+    elif reason == "Boarding in progress":
+        ui.show_passenger_still_boarding()
+    elif reason in ("No seats available", "Seat not available"):
+        ui.show_no_seats_available()
+    else:
+        ui.show_invalid()
+
+
+class AvailabilityMonitor(threading.Thread):
+    def __init__(self, users_col):
+        super().__init__(daemon=True)
+        self.users_col = users_col
+        self.stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._available = None
+        self._reason = "Not checked yet"
+
+    def is_available(self):
+        with self._lock:
+            return self._available
+
+    def get_reason(self):
+        with self._lock:
+            return self._reason
+
+    def set_state(self, available: bool, reason: str):
+        with self._lock:
+            self._available = bool(available)
+            self._reason = str(reason)
+
+    def force_unavailable(self, reason: str):
+        self.set_state(False, reason)
+
+    def _internet_ok(self):
+        try:
+            with socket.create_connection((SYSTEM_PROBE_HOST, SYSTEM_PROBE_PORT), timeout=SYSTEM_SOCKET_TIMEOUT_SEC):
+                return True, "Internet path OK"
+        except Exception as e:
+            return False, f"Internet probe failed: {e}"
+
+    def _firestore_ok(self):
+        try:
+            self.users_col.limit(1).get()
+            return True, "Firestore validation read OK"
+        except Exception as e:
+            return False, f"Firestore validation read failed: {e}"
+
+    def check_once(self):
+        ok_net, net_reason = self._internet_ok()
+        if not ok_net:
+            self.set_state(False, net_reason)
+            return False, net_reason
+
+        ok_fs, fs_reason = self._firestore_ok()
+        if not ok_fs:
+            self.set_state(False, fs_reason)
+            return False, fs_reason
+
+        self.set_state(True, "Validation available")
+        return True, "Validation available"
+
+    def run(self):
+        while not self.stop_event.is_set():
+            self.check_once()
+            self.stop_event.wait(SYSTEM_CHECK_SEC)
+
+    def stop(self):
+        self.stop_event.set()
+
+
+class SeatGate:
+    AVAILABLE = "AVAILABLE"
+    PENDING = "PENDING"
+    OCCUPIED = "OCCUPIED"
+
+    def __init__(self, pi: pigpio.pi, seat_id: str, servo_gpio: int, open_angle: float, close_angle: float, ir_gpio: int):
+        self.pi = pi
+        self.seat_id = seat_id
+        self.servo_gpio = servo_gpio
+        self.open_angle = open_angle
+        self.close_angle = close_angle
+        self.ir_gpio = ir_gpio
+
+        self.pi.set_mode(self.ir_gpio, pigpio.INPUT)
+        if IR_ACTIVE_LOW:
+            self.pi.set_pull_up_down(self.ir_gpio, pigpio.PUD_UP)
+        else:
+            self.pi.set_pull_up_down(self.ir_gpio, pigpio.PUD_DOWN)
+
+        self._ir_last_raw = None
+        self._ir_last_change = time.time()
+        self._ir_stable = False
+
+        self.state = self.AVAILABLE
+        self.pending_deadline = None
+        self.clear_deadline = None
+
+        self.gate_open = False
+        self.seat_uid = None
+
+        self.close_gate()
+
+    def _read_ir_raw(self) -> bool:
+        level = self.pi.read(self.ir_gpio)
+        return (level == 0) if IR_ACTIVE_LOW else (level == 1)
+
+    def ir_detected(self) -> bool:
+        raw = self._read_ir_raw()
+        now = time.time()
+
+        if self._ir_last_raw is None:
+            self._ir_last_raw = raw
+            self._ir_last_change = now
+            self._ir_stable = raw
+            return self._ir_stable
+
+        if raw != self._ir_last_raw:
+            self._ir_last_raw = raw
+            self._ir_last_change = now
+
+        if (now - self._ir_last_change) >= IR_DEBOUNCE_SEC:
+            self._ir_stable = self._ir_last_raw
+
+        return self._ir_stable
+
+    def open_gate(self):
+        self.pi.set_servo_pulsewidth(self.servo_gpio, angle_to_us(self.open_angle))
+        self.gate_open = True
+        time.sleep(SERVO_SETTLE_SEC)
+        if not SERVO_HOLD_OPEN:
+            self.pi.set_servo_pulsewidth(self.servo_gpio, 0)
+
+    def close_gate(self):
+        self.pi.set_servo_pulsewidth(self.servo_gpio, angle_to_us(self.close_angle))
+        self.gate_open = False
+        time.sleep(SERVO_SETTLE_SEC)
+        self.pi.set_servo_pulsewidth(self.servo_gpio, 0)
+
+    def sync_on_boot(self):
+        start = time.time()
+        while time.time() - start < 0.4:
+            self.ir_detected()
+            time.sleep(0.02)
+
+        if self.ir_detected():
+            self.state = self.OCCUPIED
+            self.pending_deadline = None
+            self.clear_deadline = None
+            self.open_gate()
+        else:
+            self.state = self.AVAILABLE
+            self.pending_deadline = None
+            self.clear_deadline = None
+            self.seat_uid = None
+            self.close_gate()
+
+    def can_accept_tap(self) -> bool:
+        if self.state != self.AVAILABLE:
+            return False
+        if self.ir_detected():
+            return False
+        return True
+
+    def start_boarding(self, uid: str) -> bool:
+        if not self.can_accept_tap():
+            return False
+        self.seat_uid = uid
+        self.open_gate()
+        self.state = self.PENDING
+        self.pending_deadline = time.time() + PENDING_SIT_TIMEOUT_SEC
+        self.clear_deadline = None
+        return True
+
+    def tick(self):
+        now = time.time()
+        detected = self.ir_detected()
+
+        if self.state == self.AVAILABLE:
+            self.pending_deadline = None
+            self.clear_deadline = None
+            return None
+
+        if self.state == self.PENDING:
+            if detected:
+                self.state = self.OCCUPIED
+                self.pending_deadline = None
+                self.clear_deadline = None
+                return ("OCCUPIED", self.seat_uid)
+
+            if self.pending_deadline is not None and now >= self.pending_deadline:
+                self.close_gate()
+                self.state = self.AVAILABLE
+                self.pending_deadline = None
+                self.clear_deadline = None
+                self.seat_uid = None
+                return ("PENDING_TIMEOUT", None)
+
+            return None
+
+        if self.state == self.OCCUPIED:
+            if detected:
+                self.clear_deadline = None
+                return None
+
+            if self.clear_deadline is None:
+                self.clear_deadline = now + IR_CLEAR_CLOSE_DELAY_SEC
+                return None
+
+            if now >= self.clear_deadline:
+                self.close_gate()
+                self.state = self.AVAILABLE
+                self.clear_deadline = None
+                self.seat_uid = None
+                return ("AVAILABLE", None)
+
+        return None
+
+
+def log_seat_event(seat_events_col, seat_id: str, event: str, status: str, phase: str, uid: str | None, gate_open: bool | None):
+    ts_ms = int(time.time() * 1000)
+    payload = {
+        "seatId": seat_id,
+        "event": event,
+        "status": status,
+        "phase": phase,
+        "uid": uid,
+        "tsMs": ts_ms,
+        "createdAt": firestore.SERVER_TIMESTAMP,
+    }
+    if gate_open is not None:
+        payload["gateOpen"] = bool(gate_open)
+    seat_events_col.document(f"{ts_ms}_{seat_id}_{event}").set(payload)
+
+
+def safe_log_seat_event(seat_events_col, seat_id, event, status, phase, uid, gate_open, availability_monitor):
+    try:
+        log_seat_event(seat_events_col, seat_id, event, status, phase, uid, gate_open)
+        return True
+    except Exception as e:
+        msg = f"Seat event write failed: {e}"
+        print(f"[FS] {msg}", flush=True)
+        availability_monitor.force_unavailable(msg)
+        return False
+
+
+def write_tap_payload(taps_col, root_ref, payload, availability_monitor):
+    try:
+        taps_col.document(str(payload["tsMs"])).set(payload)
+        root_ref.set({"lastSeen": firestore.SERVER_TIMESTAMP, "lastTap": payload}, merge=True)
+        return True
+    except Exception as e:
+        msg = f"Tap/root write failed: {e}"
+        print(f"[FS] {msg}", flush=True)
+        availability_monitor.force_unavailable(msg)
+        return False
+
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    r = 6371000.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return r * c
+
+
+def nmea_checksum_ok(sentence: str) -> bool:
+    if not sentence.startswith("$"):
+        return False
+    if "*" not in sentence:
+        return True
+    try:
+        data, cks = sentence[1:].split("*", 1)
+        calc = 0
+        for ch in data:
+            calc ^= ord(ch)
+        return int(cks.strip()[:2], 16) == calc
+    except Exception:
+        return False
+
+
+def load_terminals_from_subcollection(terminals_col):
+    try:
+        snaps = terminals_col.get()
+    except Exception:
+        return None
+    terms = {}
+    for snap in snaps:
+        tid = snap.id
+        d = snap.to_dict() or {}
+        if "lat" not in d or "lon" not in d:
+            continue
+        try:
+            terms[tid] = {
+                "lat": float(d["lat"]),
+                "lon": float(d["lon"]),
+                "radiusM": float(d.get("radiusM", DEFAULT_RADIUS_M)),
+            }
+        except Exception:
+            continue
+    return terms if terms else None
+
+
+def compute_distances(lat, lon, terminals):
+    out = {}
+    if not terminals:
+        return out
+    for tid, t in terminals.items():
+        out[tid] = haversine_m(lat, lon, t["lat"], t["lon"])
+    return out
+
+
+def choose_terminal_hysteresis(lat, lon, terminals, last_terminal: str | None):
+    if not terminals:
+        return "unknown", None
+
+    dists = compute_distances(lat, lon, terminals)
+
+    best_inside = None
+    best_inside_d = None
+    for tid, d in dists.items():
+        r = terminals[tid]["radiusM"]
+        if d <= r:
+            if best_inside is None or d < best_inside_d:
+                best_inside = tid
+                best_inside_d = d
+
+    last_terminal = last_terminal or "unknown"
+
+    if last_terminal != "unknown" and last_terminal in terminals and last_terminal in dists:
+        d_last = dists[last_terminal]
+        r_last = terminals[last_terminal]["radiusM"]
+        if d_last <= (r_last + GPS_EXIT_MARGIN_M):
+            if best_inside is not None and best_inside != last_terminal:
+                if best_inside_d is not None and (best_inside_d + GPS_SWITCH_BIAS_M) < d_last:
+                    return best_inside, best_inside_d
+            return last_terminal, d_last
+
+    if best_inside is not None:
+        return best_inside, best_inside_d
+
+    return "unknown", None
+
+
+class GPSWorker(threading.Thread):
+    def __init__(self, gps_doc_ref, terminals_col_ref):
+        super().__init__(daemon=True)
+        self.gps_doc_ref = gps_doc_ref
+        self.terminals_col_ref = terminals_col_ref
+
+        self.stop_event = threading.Event()
+        self.terminals = None
+        self.last_term_fetch = 0.0
+        self.last_term_fingerprint = None
+        self.last_send = 0.0
+        self.last_force = 0.0
+        self.last_lat = None
+        self.last_lon = None
+        self.current_terminal = "unknown"
+        self.current_terminal_dist = None
+        self.candidate_terminal = None
+        self.candidate_since = None
+
+        n = max(1, min(50, int(GPS_SMOOTH_N)))
+        self.buf = deque(maxlen=n)
+        self.last_good_gga_time = 0.0
+
+    def _quality_ok(self, fixq, sats, hdop) -> bool:
+        if fixq is None:
+            return False
+        try:
+            if int(fixq) < GPS_MIN_FIX_QUALITY:
+                return False
+        except Exception:
+            return False
+
+        if hdop is not None:
+            try:
+                if float(hdop) > GPS_MAX_HDOP:
+                    return False
+            except Exception:
+                return False
+
+        if sats is not None:
+            try:
+                if int(sats) < GPS_MIN_SATS:
+                    return False
+            except Exception:
+                return False
+
+        return True
+
+    def _smooth(self, lat, lon):
+        self.buf.append((float(lat), float(lon)))
+        la = sum(p[0] for p in self.buf) / len(self.buf)
+        lo = sum(p[1] for p in self.buf) / len(self.buf)
+        return la, lo, len(self.buf)
+
+    def run(self):
+        try:
+            ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=0.6)
+        except Exception as e:
+            print(f"[GPS] Disabled. Failed to open {GPS_PORT}: {e}", flush=True)
+            return
+
+        print(f"[GPS] Started on {GPS_PORT} @ {GPS_BAUD}", flush=True)
+
+        while not self.stop_event.is_set():
+            now = time.time()
+
+            if now - self.last_term_fetch >= TERMINALS_REFRESH_SEC:
+                try:
+                    self.terminals = load_terminals_from_subcollection(self.terminals_col_ref)
+                except Exception:
+                    self.terminals = None
+                self.last_term_fetch = now
+
+                fp = None
+                if self.terminals:
+                    fp = tuple(
+                        sorted(
+                            (k, round(v["lat"], 6), round(v["lon"], 6), round(v["radiusM"], 1))
+                            for k, v in self.terminals.items()
+                        )
+                    )
+                if fp != self.last_term_fingerprint:
+                    self.last_term_fingerprint = fp
+                    if self.terminals:
+                        print(f"[GPS] Loaded terminals: {', '.join(sorted(self.terminals.keys()))}", flush=True)
+                    else:
+                        print("[GPS] No terminals loaded (check Firestore path/fields).", flush=True)
+
+            try:
+                line = ser.readline().decode("ascii", errors="ignore").strip()
+            except Exception:
+                time.sleep(0.2)
+                continue
+
+            if not line or not line.startswith("$"):
+                continue
+            if not nmea_checksum_ok(line):
+                continue
+
+            lat = None
+            lon = None
+            fixq = None
+            sats = None
+            hdop = None
+            src = None
+
+            try:
+                msg = pynmea2.parse(line)
+                t = msg.sentence_type
+
+                if t == "GGA":
+                    src = "GGA"
+                    if getattr(msg, "lat", None) and getattr(msg, "lon", None):
+                        lat = msg.latitude
+                        lon = msg.longitude
+                    fixq = getattr(msg, "gps_qual", None)
+                    sats = getattr(msg, "num_sats", None)
+                    hdop = getattr(msg, "horizontal_dil", None)
+
+                    if self._quality_ok(fixq, sats, hdop):
+                        self.last_good_gga_time = now
+                    else:
+                        continue
+
+                elif t == "RMC":
+                    src = "RMC"
+                    if GPS_USE_GGA_ONLY:
+                        continue
+
+                    if (now - self.last_good_gga_time) > 2.0:
+                        continue
+
+                    try:
+                        if getattr(msg, "status", None) != "A":
+                            continue
+                    except Exception:
+                        continue
+
+                    if getattr(msg, "lat", None) and getattr(msg, "lon", None):
+                        lat = msg.latitude
+                        lon = msg.longitude
+                    else:
+                        continue
+                else:
+                    continue
+
+            except Exception:
+                continue
+
+            if lat is None or lon is None:
+                continue
+
+            s_lat, s_lon, s_n = self._smooth(lat, lon)
+
+            cand_terminal, cand_dist = choose_terminal_hysteresis(
+                s_lat, s_lon, self.terminals, self.current_terminal
+            )
+
+            terminal_changed = False
+            if cand_terminal != self.current_terminal:
+                if self.candidate_terminal != cand_terminal:
+                    self.candidate_terminal = cand_terminal
+                    self.candidate_since = now
+                else:
+                    if self.candidate_since is not None and (now - self.candidate_since) >= GPS_STABLE_SEC:
+                        self.current_terminal = cand_terminal
+                        self.current_terminal_dist = cand_dist
+                        self.candidate_terminal = None
+                        self.candidate_since = None
+                        terminal_changed = True
+                        print(
+                            f"[GPS] currentTerminal={self.current_terminal} lat={s_lat} lon={s_lon} (smoothN={s_n})",
+                            flush=True,
+                        )
+            else:
+                self.candidate_terminal = None
+                self.candidate_since = None
+                self.current_terminal_dist = cand_dist
+
+            should_send = False
+
+            if self.last_lat is None or self.last_lon is None:
+                should_send = True
+
+            if terminal_changed:
+                should_send = True
+
+            if self.last_lat is not None and self.last_lon is not None:
+                moved = haversine_m(s_lat, s_lon, self.last_lat, self.last_lon)
+                if moved >= GPS_MIN_MOVE_M and (now - self.last_send) >= GPS_UPLOAD_SEC:
+                    should_send = True
+
+            if GPS_FORCE_SEC > 0 and (now - self.last_force) >= GPS_FORCE_SEC:
+                should_send = True
+                self.last_force = now
+
+            if should_send:
+                payload = {
+                    "deviceId": DEVICE_ID,
+                    "cityId": CITY_ID,
+                    "lat": float(s_lat),
+                    "lon": float(s_lon),
+                    "src": src,
+                    "fixQ": fixq,
+                    "sats": sats,
+                    "hdop": hdop,
+                    "smoothN": int(s_n),
+                    "currentTerminal": self.current_terminal,
+                    "distM": self.current_terminal_dist,
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                    "sentAt": _now_iso(),
+                }
+                try:
+                    self.gps_doc_ref.set(payload, merge=True)
+                except Exception as e:
+                    print(f"[GPS] Firestore write failed: {e}", flush=True)
+
+                self.last_send = now
+                self.last_lat = s_lat
+                self.last_lon = s_lon
+
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+    def stop(self):
+        self.stop_event.set()
+
+
+def main():
+    print("[STEP021] Full firmware starting", flush=True)
+    print(f"[STEP021] DEVICE_ID: {DEVICE_ID}", flush=True)
+    print(f"[STEP021] FS_ROOT: {FS_ROOT}", flush=True)
+    print(f"[STEP021] CITY_ID: {CITY_ID}", flush=True)
+    print(
+        "[STEP021] Priority order: system unavailable > inactive > unregistered > duplicate > "
+        "destination not selected > insufficient balance > passenger still boarding > no seats available > invalid fallback",
+        flush=True,
+    )
+
+    db = init_firestore()
+    root_ref, taps_col, seat_events_col, gps_doc_ref, terminals_col_ref, users_col = fs_refs(db)
+
+    rdr = pick_reader()
+    print(f"[STEP021] Reader: {rdr}", flush=True)
+
+    ui = TFTUI()
+
+    pi = pigpio.pi()
+    if not pi.connected:
+        raise RuntimeError("pigpio not connected. Ensure pigpiod is running.")
+
+    seat1 = SeatGate(pi, "seat1", SERVO1_GPIO, SERVO1_OPEN_ANGLE, SERVO1_CLOSE_ANGLE, IR1_GPIO)
+    seat2 = SeatGate(pi, "seat2", SERVO2_GPIO, SERVO2_OPEN_ANGLE, SERVO2_CLOSE_ANGLE, IR2_GPIO)
+
+    seat1.sync_on_boot()
+    seat2.sync_on_boot()
+
+    availability_monitor = AvailabilityMonitor(users_col)
+    initial_ok, initial_reason = availability_monitor.check_once()
+    print(f"[SYS] Initial validation availability: {initial_ok} reason={initial_reason}", flush=True)
+    availability_monitor.start()
+
+    safe_log_seat_event(
+        seat_events_col,
+        "seat1",
+        "boot_state",
+        "occupied" if seat1.state == seat1.OCCUPIED else "available",
+        "in_seat" if seat1.state == seat1.OCCUPIED else "idle",
+        seat1.seat_uid,
+        seat1.gate_open,
+        availability_monitor,
+    )
+    safe_log_seat_event(
+        seat_events_col,
+        "seat2",
+        "boot_state",
+        "occupied" if seat2.state == seat2.OCCUPIED else "available",
+        "in_seat" if seat2.state == seat2.OCCUPIED else "idle",
+        seat2.seat_uid,
+        seat2.gate_open,
+        availability_monitor,
+    )
+
+    gps_worker = GPSWorker(gps_doc_ref, terminals_col_ref)
+    gps_worker.start()
+
+    present_uid = None
+    revert_at = None
+    system_unavailable_active = False
+    last_system_reason = None
+
+    try:
+        while True:
+            now = time.time()
+
+            system_available = availability_monitor.is_available()
+            system_reason = availability_monitor.get_reason()
+
+            if system_available is False:
+                if (not system_unavailable_active) or (system_reason != last_system_reason):
+                    ui.show_system_unavailable()
+                    revert_at = None
+                    system_unavailable_active = True
+                    last_system_reason = system_reason
+                    print(f"[SYS] UNAVAILABLE: {system_reason}", flush=True)
+            elif system_available is True:
+                if system_unavailable_active:
+                    ui.show_default()
+                    revert_at = None
+                    system_unavailable_active = False
+                    print("[SYS] RECOVERED: validation available again", flush=True)
+                last_system_reason = system_reason
+
+            if not system_unavailable_active and revert_at is not None and now >= revert_at:
+                ui.show_default()
+                revert_at = None
+
+            for seat in (seat1, seat2):
+                ev = seat.tick()
+                if ev is None:
+                    continue
+
+                kind, ev_uid = ev
+                if kind == "OCCUPIED":
+                    print(f"[IR] {seat.seat_id} OCCUPIED", flush=True)
+                    safe_log_seat_event(
+                        seat_events_col, seat.seat_id, "ir_occupied", "occupied", "in_seat", ev_uid, seat.gate_open, availability_monitor
+                    )
+                elif kind == "AVAILABLE":
+                    print(f"[IR] {seat.seat_id} AVAILABLE (cleared + closed)", flush=True)
+                    safe_log_seat_event(
+                        seat_events_col, seat.seat_id, "ir_available", "available", "idle", None, seat.gate_open, availability_monitor
+                    )
+                elif kind == "PENDING_TIMEOUT":
+                    print(f"[IR] {seat.seat_id} pending timeout, seat AVAILABLE", flush=True)
+                    safe_log_seat_event(
+                        seat_events_col, seat.seat_id, "pending_timeout", "available", "idle", None, seat.gate_open, availability_monitor
+                    )
+
+            uid = read_uid_once(rdr)
+
+            if uid and present_uid is None:
+                present_uid = uid
+
+                # 1. System unavailable
+                if system_unavailable_active:
+                    ui.show_system_unavailable()
+                    revert_at = None
+                    print(f"[TAP] BLOCKED {uid} reason=System unavailable", flush=True)
+                    time.sleep(0.05)
+                    continue
+
+                verdict = validate_uid(uid)
+                ts_ms = int(time.time() * 1000)
+                payload = {
+                    "deviceId": DEVICE_ID,
+                    "uid": uid,
+                    "known": verdict["known"],
+                    "active": verdict["active"],
+                    "name": verdict["name"],
+                    "reason": verdict["reason"],
+                    "tsMs": ts_ms,
+                    "sentAt": _now_iso(),
+                    "seatId": None,
+                    "result": "invalid",
+                }
+
+                # 2. Inactive account
+                if verdict["known"] and not verdict["active"]:
+                    show_invalid_reason(ui, verdict["reason"])
+                    revert_at = time.time() + SHOW_INVALID_SEC
+                    print(f"[TAP] INVALID {uid} reason={verdict['reason']}", flush=True)
+                    write_tap_payload(taps_col, root_ref, payload, availability_monitor)
+                    time.sleep(0.05)
+                    continue
+
+                # 3. Unregistered account
+                if not verdict["known"]:
+                    show_invalid_reason(ui, verdict["reason"])
+                    revert_at = time.time() + SHOW_INVALID_SEC
+                    print(f"[TAP] INVALID {uid} reason={verdict['reason']}", flush=True)
+                    write_tap_payload(taps_col, root_ref, payload, availability_monitor)
+                    time.sleep(0.05)
+                    continue
+
+                lookup_decision, user_id, user_data, lookup_reason = lookup_user_by_card(users_col, uid)
+
+                if lookup_decision == "unavailable":
+                    availability_monitor.force_unavailable(lookup_reason)
+                    ui.show_system_unavailable()
+                    revert_at = None
+                    print(f"[TAP] BLOCKED {uid} reason=System unavailable during user lookup", flush=True)
+                    time.sleep(0.05)
+                    continue
+
+                if lookup_decision == "no_linked_user":
+                    payload["reason"] = "No user linked to card"
+                    show_invalid_reason(ui, payload["reason"])
+                    revert_at = time.time() + SHOW_INVALID_SEC
+                    print(f"[TAP] REJECT {uid} reason=No user linked to card", flush=True)
+                    write_tap_payload(taps_col, root_ref, payload, availability_monitor)
+                    time.sleep(0.05)
+                    continue
+
+                payload["userId"] = user_id
+
+                # 4. Duplicate tap detected
+                is_duplicate, duplicate_seat_id, duplicate_phase = find_duplicate_tap(uid, (seat1, seat2))
+                if is_duplicate:
+                    payload["reason"] = "Duplicate tap detected"
+                    payload["duplicateSeatId"] = duplicate_seat_id
+                    payload["duplicatePhase"] = duplicate_phase
+                    show_invalid_reason(ui, payload["reason"])
+                    revert_at = time.time() + SHOW_INVALID_SEC
+                    print(
+                        f"[TAP] REJECT {uid} reason=Duplicate tap detected seat={duplicate_seat_id} phase={duplicate_phase}",
+                        flush=True,
+                    )
+                    write_tap_payload(taps_col, root_ref, payload, availability_monitor)
+                    time.sleep(0.05)
+                    continue
+
+                # 5. Destination not selected
+                waiting_ok, wait_reason = user_has_required_status(user_data)
+                if not waiting_ok:
+                    payload["reason"] = wait_reason
+                    show_invalid_reason(ui, wait_reason)
+                    revert_at = time.time() + SHOW_INVALID_SEC
+                    print(f"[TAP] REJECT {uid} reason={wait_reason}", flush=True)
+                    write_tap_payload(taps_col, root_ref, payload, availability_monitor)
+                    time.sleep(0.05)
+                    continue
+
+                # 6. Insufficient balance
+                bal_decision, balance_reason, current_balance, required_fare, route_from, route_to = check_user_balance_for_trip_by_data(user_data)
+
+                if bal_decision == "reject":
+                    payload["reason"] = "Insufficient balance"
+                    payload["balance"] = current_balance
+                    payload["requiredFare"] = required_fare
+                    payload["routeFrom"] = route_from
+                    payload["routeTo"] = route_to
+                    show_invalid_reason(ui, payload["reason"])
+                    revert_at = time.time() + SHOW_INVALID_SEC
+                    print(
+                        f"[TAP] REJECT {uid} reason=Insufficient balance "
+                        f"balance={current_balance} fare={required_fare} from={route_from} to={route_to}",
+                        flush=True,
+                    )
+                    write_tap_payload(taps_col, root_ref, payload, availability_monitor)
+                    time.sleep(0.05)
+                    continue
+
+                if bal_decision == "invalid_data":
+                    print(f"[BAL] Skip balance reject for uid={uid}. {balance_reason}", flush=True)
+
+                # 7. Passenger still boarding
+                any_pending = (seat1.state == seat1.PENDING) or (seat2.state == seat2.PENDING)
+                if any_pending:
+                    payload["reason"] = "Boarding in progress"
+                    show_invalid_reason(ui, payload["reason"])
+                    revert_at = time.time() + SHOW_INVALID_SEC
+                    print(f"[TAP] REJECT {uid} reason=Boarding in progress", flush=True)
+                    write_tap_payload(taps_col, root_ref, payload, availability_monitor)
+                    time.sleep(0.05)
+                    continue
+
+                # 8. No seats available
+                chosen = None
+                if seat1.can_accept_tap():
+                    chosen = seat1
+                elif seat2.can_accept_tap():
+                    chosen = seat2
+
+                if chosen is None:
+                    payload["reason"] = "No seats available"
+                    show_invalid_reason(ui, payload["reason"])
+                    revert_at = time.time() + SHOW_INVALID_SEC
+                    print(f"[TAP] VALID {uid} but no seats available", flush=True)
+                    write_tap_payload(taps_col, root_ref, payload, availability_monitor)
+                    time.sleep(0.05)
+                    continue
+
+                ok = chosen.start_boarding(uid)
+                if not ok:
+                    payload["reason"] = "Seat not available"
+                    show_invalid_reason(ui, payload["reason"])
+                    revert_at = time.time() + SHOW_INVALID_SEC
+                    print(f"[TAP] VALID {uid} but seat not available", flush=True)
+                    write_tap_payload(taps_col, root_ref, payload, availability_monitor)
+                    time.sleep(0.05)
+                    continue
+
+                # Valid flow
+                payload["seatId"] = chosen.seat_id
+                payload["result"] = "valid"
+                payload["reason"] = "Valid card"
+
+                write_ok = write_tap_payload(taps_col, root_ref, payload, availability_monitor)
+                safe_log_seat_event(
+                    seat_events_col,
+                    chosen.seat_id,
+                    "tap_reserved",
+                    "available",
+                    "boarding",
+                    uid,
+                    chosen.gate_open,
+                    availability_monitor,
+                )
+
+                if availability_monitor.is_available() is False:
+                    ui.show_system_unavailable()
+                    revert_at = None
+                    print(f"[TAP] VALID {uid} started boarding but system became unavailable after write", flush=True)
+                elif write_ok:
+                    ui.show_valid()
+                    revert_at = time.time() + SHOW_VALID_SEC
+                    print(f"[TAP] VALID {uid} -> {chosen.seat_id} gate OPEN, waiting IR", flush=True)
+
+            elif not uid and present_uid is not None:
+                present_uid = None
+
+            time.sleep(0.05)
+
+    except KeyboardInterrupt:
+        print("\n[STEP021] Stopped by user", flush=True)
+
+    finally:
+        try:
+            availability_monitor.stop()
+        except Exception:
+            pass
+        try:
+            gps_worker.stop()
+        except Exception:
+            pass
+        try:
+            pi.set_servo_pulsewidth(SERVO1_GPIO, 0)
+            pi.set_servo_pulsewidth(SERVO2_GPIO, 0)
+        except Exception:
+            pass
+        try:
+            pi.stop()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
