@@ -1,97 +1,56 @@
-# CPE11-AFCS (4CPEA-11)
+# CPE11-AFCS — Automated Fare Collection System
 
-Automated fare collection: **Commuter** (this `src/` app), **Driver** (`4CPEA-11-DRIVER/`), **Admin** (`4CPEA-11-ADMIN/`), **Cloud Functions** (`functions/`, `cpe-11/`), Firebase config, and `docs/SYSTEM_TUTORIAL.md`.
+![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi%204-A22846?style=flat&logo=raspberrypi&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white)
+![React](https://img.shields.io/badge/React%2018-61DAFB?style=flat&logo=react&logoColor=black)
+![Firebase](https://img.shields.io/badge/Firebase-FFCA28?style=flat&logo=firebase&logoColor=black)
+![Linux](https://img.shields.io/badge/Linux-FCC624?style=flat&logo=linux&logoColor=black)
 
-## Features
+A Raspberry Pi 4–based automated fare collection system for modern jeepneys: NFC tap-in/tap-out, GPS-based fare computation, seat occupancy sensing, and automated gate control on the embedded side, synchronized in real time with **Commuter**, **Driver**, and **Admin** web apps over Firebase.
 
-- **Login Page**: Email and password authentication
-- **Two-Step Verification**: 6-digit code verification
-- **Commuter Dashboard**: 
-  - Card balance display
-  - Available modern jeepneys with passenger count (up to 2 passengers)
-  - Direction indicators (right/left arrows)
-  - Destination terminal selection
-- **Choose Destination Terminal**: 
-  - Filter terminals based on current location
-  - Extend route functionality
+**Role:** Team Leader — led a 5-person multidisciplinary team through a modified V-Model with iterative prototyping (Dec 2025 – Apr 2026).
 
-## Getting Started
+**Validation:** Functional, integration, system, expert, and user testing against ISO/IEC 25010:2023 quality characteristics — **4.56/5 expert score, 4.57/5 user score**.
 
-### Prerequisites
+## System Overview
 
-- Node.js (v16 or higher)
-- npm or yarn
+| Layer | What it does |
+|---|---|
+| **Embedded firmware** (Raspberry Pi 4, Python) | Event-driven state machine governing boarding, destination selection, fare computation, seat reservation, and tap-in/tap-out. Integrates USB NFC (ACR1252U), UART GPS, SPI TFT display (ILI9488), PWM gate servos, and GPIO IR seat sensors. Timeout handling, duplicate-tap prevention, and fault recovery built in. |
+| **Commuter app** (`src/`) | Passenger-facing: login + 2FA, card balance, live jeepney availability with seat counts, terminal selection, route extension. |
+| **Driver app** (`4CPEA-11-DRIVER/`) | Operator-facing: passenger manifest, route/shift management, daily earnings view. |
+| **Admin app** (`4CPEA-11-ADMIN/`) | Office-facing: fleet totals, trends, terminal management, reporting. |
+| **Cloud** | Firebase Auth, Firestore, Cloud Functions (`functions/`, `cpe-11/`), Hosting. Firmware syncs via event-driven REST calls (not polling) to cut redundant writes. |
 
-### Installation
+## Getting Started (web apps)
 
-1. Install dependencies:
 ```bash
 npm install
+npm run dev        # http://localhost:3000
 ```
 
-2. Start the development server:
-```bash
-npm run dev
-```
-
-3. Open your browser and navigate to `http://localhost:3000`
-
-### Building for production
-
-**Commuter only** (output in root `dist/`):
+Build for production:
 
 ```bash
-npm run build
+npm run build        # commuter app only → dist/
+npm run build:all    # all web apps → dist-combined/ (for Firebase Hosting)
 ```
 
-**All web apps** for Firebase Hosting (output in `dist-combined/`; ignored by git — run before deploy):
+Install dependencies in each sub-app first if needed: root, `4CPEA-11-ADMIN`, `4CPEA-11-DRIVER`, `functions`, `cpe-11`.
 
-```bash
-npm run build:all
-```
+Deploy: `firebase deploy` (see `HOSTINGER_DEPLOYMENT.md` for static hosting alternative).
 
-Install dependencies in each app first if needed: root, `4CPEA-11-ADMIN`, `4CPEA-11-DRIVER`, `functions`, and `cpe-11` (`npm install` in each).
+Firebase config: copy `src/firebase/config.example.js` → `src/firebase/config.js` and fill in your project credentials.
 
-### Deploy (Firebase)
+## Embedded Firmware
 
-```bash
-npm run build:all
-firebase deploy
-```
+The Raspberry Pi firmware source is included as [`firmware_src.txt`](firmware_src.txt) (hardware-dependent — requires the physical NFC reader, GPS receiver, TFT display, and sensor rig to run). It implements the state machine and hardware integration described above.
 
-Use `firebase deploy --only hosting` or `--only functions` as needed. See **HOSTINGER_DEPLOYMENT.md** and **HOW_TO_UPLOAD_HTACCESS.md** for static hosting on Hostinger.
+## Docs
 
-## Project Structure
+- [`docs/SYSTEM_TUTORIAL.md`](docs/SYSTEM_TUTORIAL.md) — full guided walkthrough of the system (architecture, security, design rationale)
+- [`HOSTINGER_DEPLOYMENT.md`](HOSTINGER_DEPLOYMENT.md) — static hosting deployment guide
 
-```
-src/
-  ├── pages/
-  │   ├── LoginPage.jsx
-  │   ├── TwoStepVerificationPage.jsx
-  │   ├── CommuterDashboard.jsx
-  │   └── ChooseDestinationPage.jsx
-  ├── App.jsx
-  ├── App.css
-  ├── main.jsx
-  └── index.css
-```
+## Tech Stack
 
-## Usage
-
-1. **Login**: Enter your email and password on the login page
-2. **Verify**: Enter the 6-digit verification code
-3. **Dashboard**: View your card balance and available jeepneys
-4. **Choose Destination**: Select a destination terminal (excludes current terminal)
-5. **Extend Route**: Extend your current route to additional terminals
-
-## Notes
-
-- Firebase (Auth, Firestore, Functions, Hosting). Configure `src/firebase/config.js` (see `config.example.js`).
-- Do not commit `dist/`, `dist-combined/`, or `4CPEA-11-DRIVER/dist/` — build outputs are gitignored; produce them with the build commands above.
-
-## Technologies Used
-
-- React 18
-- React Router DOM
-- Vite
-- CSS3 (Mobile-first responsive design)
+Raspberry Pi 4 · Python · React 18 · React Router · Vite · Firebase (Auth, Firestore, Functions, Hosting) · NFC (ACR1252U/DESFire EV2) · GPS · UART/SPI/GPIO/PWM
