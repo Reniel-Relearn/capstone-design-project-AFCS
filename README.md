@@ -177,11 +177,16 @@ The embedded code cannot be fully exercised without the Raspberry Pi, reader, GP
 
 ## Testing and evidence
 
-The capstone team performed functional, integration, system, expert, and user evaluation. The previous README reported **4.56/5 from expert evaluators** and **4.57/5 from users** against ISO/IEC 25010 quality characteristics. These figures are retained as **reported capstone results**; the raw questionnaires, calculation sheets, and signed evaluation records are not committed here, so they cannot be independently reproduced from this repository.
+The capstone team performed functional, integration, system, expert, and user evaluation. The supporting workbooks are published in anonymized form so the calculations can be reviewed without exposing respondent identities:
 
-The candidate totals of 2,188 checks, 2,156 passes, 32 limitations/failures, and 98.54% are **not stated in the available repository documentation** and are therefore not presented as verified results.
+- [Technical test execution results](docs/evidence/AFCS_Test_Execution_Results.xlsx)
+- [Expert and user evaluation results](docs/evidence/AFCS_Evaluation_Results_Anonymized.xlsx)
 
-Repository-level verification currently consists of inspecting implemented firmware, Cloud Function, security-rule, and UI code paths. No automated JavaScript/Python test suite or machine-readable test report is committed.
+Independent recalculation of the test scoreboard confirms **21 test categories**, **2,188 executions**, **2,156 correct outcomes**, **32 incorrect or limited outcomes**, and a **98.54% aggregate success rate**. These are prototype-validation results, not a production availability or reliability guarantee.
+
+The evaluation workbook contains responses from **12 expert evaluators** and **100 user respondents**. Its summary calculations produce an expert mean of **4.56/5** and a combined user mean of **4.56/5**. The previously reported user score of 4.57/5 was corrected after checking both user-evaluation sections together.
+
+No automated JavaScript/Python test suite or continuous-integration test report is committed. The test workbook also retains one Google Sheets-specific `MINUS` formula in a timing-analysis cell that may display `#NAME?` when recalculated in Excel; it does not affect the published category totals or aggregate success rate.
 
 As part of this documentation audit, `npm run build:all` successfully produced production bundles for the commuter, driver, and administrator applications. Vite reported bundle-size and mixed dynamic/static import warnings, but no build failure.
 
@@ -203,7 +208,7 @@ The commuter, driver, and administrator applications; Firebase services; physica
 ## Known limitations and production considerations
 
 - Physical hardware and the deployed Firebase project are required for end-to-end reproduction.
-- Raw test matrices and evaluation evidence are not included in the repository.
+- Public evidence workbooks exclude direct respondent identifiers; raw identifying questionnaires and signed records remain private.
 - There is no committed automated test suite or continuous-integration workflow.
 - The root lockfile is not synchronized with `package.json`, and dependency installation reports deprecated packages and security-audit findings; dependencies should be reviewed before production use.
 - `verificationCodes/{email}` is currently open in `firestore.rules`; the detailed tutorial correctly identifies this as unsuitable for production and recommends server-only access.
